@@ -24,6 +24,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...modeling_outputs import BackboneOutput
@@ -496,6 +497,8 @@ class SwinSelfAttention(nn.Module):
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        print("?1:", self.num_attention_heads, self.attention_head_size)
+        print("?2:", x.shape)
         x = x.view(new_x_shape)
         return x.permute(0, 2, 1, 3)
 
@@ -518,12 +521,16 @@ class SwinSelfAttention(nn.Module):
 
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
 
+        print(self.relative_position_bias_table.shape)
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
         relative_position_bias = relative_position_bias.view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1
         )
 
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        print("attn_score_shape:", attention_scores.shape)
+        print("relative_pos_shape:", relative_position_bias.shape)
+        print("relative_pos_unsq_shape:", relative_position_bias.unsqueeze(0).shape)
         attention_scores = attention_scores + relative_position_bias.unsqueeze(0)
 
         if attention_mask is not None:
@@ -549,7 +556,11 @@ class SwinSelfAttention(nn.Module):
         context_layer = torch.matmul(attention_probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        print("before_merge_heads:", context_layer.shape)
+        print(self.all_head_size)
+        print(new_context_layer_shape)
         context_layer = context_layer.view(new_context_layer_shape)
+        # context_layer = torch.cat([context_layer[:, :, i, :] for i in range(context_layer.shape[2])], dim=-1)
 
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
 
@@ -628,14 +639,14 @@ class SwinOutput(nn.Module):
         self.dense = nn.Linear(int(config.mlp_ratio * dim), dim)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, before_hidden_states: torch.Tensor, pattern=None) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        return hidden_states
+        return before_hidden_states + hidden_states
 
 
 class SwinLayer(nn.Module):
-    def __init__(self, config, dim, input_resolution, num_heads, drop_path_rate=0.0, shift_size=0):
+    def __init__(self, config, dim, input_resolution, num_heads, shift_size=0):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.shift_size = shift_size
@@ -643,7 +654,7 @@ class SwinLayer(nn.Module):
         self.input_resolution = input_resolution
         self.layernorm_before = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         self.attention = SwinAttention(config, dim, num_heads, window_size=self.window_size)
-        self.drop_path = SwinDropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.drop_path = SwinDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
         self.layernorm_after = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         self.intermediate = SwinIntermediate(config, dim)
         self.output = SwinOutput(config, dim)
@@ -728,16 +739,37 @@ class SwinLayer(nn.Module):
             height_pad, width_pad, dtype=hidden_states.dtype, device=hidden_states_windows.device
         )
 
+        # 여기 지점에서 쪼개짐
         attention_outputs = self.attention(
             hidden_states_windows, attn_mask, head_mask, output_attentions=output_attentions
         )
 
         attention_output = attention_outputs[0]
+        print("⭐ Before:", attention_output.shape)
 
-        attention_windows = attention_output.view(-1, self.window_size, self.window_size, channels)
+        # NOTE: view 연산 다수 발생. 효율성은 우선 생각하지 않고 구현 진행.
+        # ============================================================================================ # 
+        #                                            패딩 진행                                           #
+        # ============================================================================================ # 
+        
+        import torch.distributed as dist
+
+        rank = dist.get_rank()
+        pad_size = self.window_size * self.window_size - attention_output.shape[1]
+        pad_config = (0, 0, 0, pad_size) if rank == 0 else (0, 0, pad_size, 0)
+
+        padded_tensor = F.pad(attention_output, pad_config, value=float('nan')) # padding을 NaN 값으로 채우기
+
+        print("⭐ After:", padded_tensor.shape) # 패딩된 텐서 shape 확인 
+        print(torch.isnan(padded_tensor).sum()) # NaN 개수 확인
+
+        attention_windows = padded_tensor.view(-1, self.window_size, self.window_size, channels)
         shifted_windows = window_reverse(attention_windows, self.window_size, height_pad, width_pad)
 
+        # ============================================================================================ # 
+        
         # reverse cyclic shift
+        # BUG
         if self.shift_size > 0:
             attention_windows = torch.roll(shifted_windows, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
@@ -746,14 +778,85 @@ class SwinLayer(nn.Module):
         was_padded = pad_values[3] > 0 or pad_values[5] > 0
         if was_padded:
             attention_windows = attention_windows[:, :height, :width, :].contiguous()
-
+        
+        # ============================================================================================ # 
+        #                                            패딩 진행                                           #
+        # ============================================================================================ # 
+        
         attention_windows = attention_windows.view(batch_size, height * width, channels)
+        print(attention_windows.shape)
+
+        # NaN 값을 기준으로 연속된 블록을 분리
+        nan_mask = torch.isnan(attention_windows[0, :, 0])
+        not_nan_mask = ~nan_mask
+        print(len(not_nan_mask))
+
+        diff = torch.diff(nan_mask.int())
+        start_indices = torch.where(diff == -1)[0] + 1 # NaN → 숫자로 바뀌는 위치
+        end_indices = torch.where(diff == 1)[0] + 1  # 숫자 → NaN으로 바뀌는 위치
+
+        # 처음부터 NaN이 아닐 경우 첫 블록 추가
+        if not_nan_mask[0]:
+            start_indices = torch.cat([torch.tensor([0]), start_indices])
+        
+        # 끝까지 NaN이 아닐 경우 마지막 블록 추가
+        if not_nan_mask[-1]:
+            end_indices = torch.cat([end_indices, torch.tensor([attention_windows.shape[1]])])
+        
+        # 각 구간을 잘라서 리스트로 반환
+        valid_slices_attn_windows = [
+            attention_windows[:, start:end, :] 
+            for start, end in zip(start_indices, end_indices)
+        ]
+        valid_slices_shortcut = [
+            shortcut[:, start:end, :] 
+            for start, end in zip(start_indices, end_indices)
+        ]
+
+        # 결과 확인
+        print(f"추출된 리스트 길이: {len(valid_slices_attn_windows)}")  # 몇 개의 블록으로 나눠졌는지
+        print(f"각 요소의 크기: {[x.shape[1] for x in valid_slices_attn_windows]}")  # 각 블록 크기 확인
+
+        count = 0
+        for x in valid_slices_attn_windows:
+            count += x.shape[1]
+
+        print(f"NaN이 아닌 개수: {count}")
+        attention_windows = torch.cat(valid_slices_attn_windows, dim=1)  # 두 번째 차원으로 합침
+        shortcut = torch.cat(valid_slices_shortcut, dim=1)
+        print(f"shortcut_shape: {shortcut.shape}")
+
+        # ============================================================================================ # 
 
         hidden_states = shortcut + self.drop_path(attention_windows)
 
         layer_output = self.layernorm_after(hidden_states)
         layer_output = self.intermediate(layer_output)
-        layer_output = hidden_states + self.output(layer_output)
+
+        # NOTE: all-gather 을 위해 self.output의 input에 필요한 정보(partition) 추가
+        def count_true_false_sequences(tensor):
+            diff = tensor[1:] != tensor[:-1]
+            change_indices = torch.where(diff)[0]
+            all_indices = torch.cat([change_indices, torch.tensor([len(tensor) - 1])])
+            start_indices = torch.cat([torch.tensor([-1]), change_indices])
+            group_lengths = all_indices - start_indices
+            first_is_true = tensor[0].item()
+            
+            # True와 False 그룹 분리
+            if first_is_true:
+                true_lengths = group_lengths[::2]
+                false_lengths = group_lengths[1::2]
+            else:
+                false_lengths = group_lengths[::2]
+                true_lengths = group_lengths[1::2]
+            
+            return true_lengths, false_lengths
+        
+        partitions = count_true_false_sequences(not_nan_mask)
+        # print(partitions[0])
+        # print(partitions[1])
+        print("hidden_states_shape:", hidden_states.shape)
+        layer_output = self.output(layer_output, hidden_states, partitions)
 
         layer_outputs = (layer_output, attention_outputs[1]) if output_attentions else (layer_output,)
         return layer_outputs
@@ -771,7 +874,6 @@ class SwinStage(nn.Module):
                     dim=dim,
                     input_resolution=input_resolution,
                     num_heads=num_heads,
-                    drop_path_rate=drop_path[i],
                     shift_size=0 if (i % 2 == 0) else config.window_size // 2,
                 )
                 for i in range(depth)
