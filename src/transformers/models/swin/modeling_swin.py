@@ -399,6 +399,7 @@ class SwinPatchMerging(nn.Module):
         height, width = input_dimensions
         # `dim` is height * width
         batch_size, dim, num_channels = input_feature.shape
+        print(input_feature.shape)
 
         input_feature = input_feature.view(batch_size, height, width, num_channels)
         # pad input to be disible by width and height, if needed
@@ -789,7 +790,9 @@ class SwinLayer(nn.Module):
         # NaN 값을 기준으로 연속된 블록을 분리
         nan_mask = torch.isnan(attention_windows[0, :, 0])
         not_nan_mask = ~nan_mask
+        print("======================================================")
         print(len(not_nan_mask))
+        print(not_nan_mask)
 
         diff = torch.diff(nan_mask.int())
         start_indices = torch.where(diff == -1)[0] + 1 # NaN → 숫자로 바뀌는 위치
@@ -834,7 +837,7 @@ class SwinLayer(nn.Module):
         layer_output = self.intermediate(layer_output)
 
         # NOTE: all-gather 을 위해 self.output의 input에 필요한 정보(partition) 추가
-        def count_true_false_sequences(tensor):
+        def true_false_sequences(tensor):
             diff = tensor[1:] != tensor[:-1]
             change_indices = torch.where(diff)[0]
             all_indices = torch.cat([change_indices, torch.tensor([len(tensor) - 1])])
@@ -852,11 +855,16 @@ class SwinLayer(nn.Module):
             
             return true_lengths, false_lengths
         
-        partitions = count_true_false_sequences(not_nan_mask)
-        # print(partitions[0])
-        # print(partitions[1])
+        partitions = true_false_sequences(not_nan_mask)
+        print("======================================================")
+        print("check1:", len(partitions[0]))
+        print(partitions[0].tolist())
+        print("check2:", len(partitions[1]))
+        print(partitions[1].tolist())
         print("hidden_states_shape:", hidden_states.shape)
-        layer_output = self.output(layer_output, hidden_states, partitions)
+        print("======================================================")
+        order = rank if not_nan_mask[0] == True else None
+        layer_output = self.output(layer_output, hidden_states, (partitions, order))
 
         layer_outputs = (layer_output, attention_outputs[1]) if output_attentions else (layer_output,)
         return layer_outputs
