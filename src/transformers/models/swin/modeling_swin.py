@@ -647,7 +647,7 @@ class SwinOutput(nn.Module):
 
 
 class SwinLayer(nn.Module):
-    def __init__(self, config, dim, input_resolution, num_heads, shift_size=0):
+    def __init__(self, config, dim, input_resolution, num_heads, shift_size=0, rank=None):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.shift_size = shift_size
@@ -659,6 +659,7 @@ class SwinLayer(nn.Module):
         self.layernorm_after = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         self.intermediate = SwinIntermediate(config, dim)
         self.output = SwinOutput(config, dim)
+        self.rank = rank
 
     def set_shift_and_window_size(self, input_resolution):
         if min(input_resolution) <= self.window_size:
@@ -709,7 +710,7 @@ class SwinLayer(nn.Module):
         input_dimensions: Tuple[int, int],
         head_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
-        always_partition: Optional[bool] = False,
+        always_partition: Optional[bool] = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not always_partition:
             self.set_shift_and_window_size(input_dimensions)
@@ -753,11 +754,11 @@ class SwinLayer(nn.Module):
         #                                            패딩 진행                                           #
         # ============================================================================================ # 
         
-        import torch.distributed as dist
+        # import torch.distributed as dist
 
-        rank = dist.get_rank()
+        # rank = dist.get_rank()
         pad_size = self.window_size * self.window_size - attention_output.shape[1]
-        pad_config = (0, 0, 0, pad_size) if rank == 0 else (0, 0, pad_size, 0)
+        pad_config = (0, 0, 0, pad_size) if self.rank == 0 else (0, 0, pad_size, 0)
 
         padded_tensor = F.pad(attention_output, pad_config, value=float('nan')) # padding을 NaN 값으로 채우기
 
@@ -863,7 +864,7 @@ class SwinLayer(nn.Module):
         print(partitions[1].tolist())
         print("hidden_states_shape:", hidden_states.shape)
         print("======================================================")
-        order = rank if not_nan_mask[0] == True else None
+        order = self.rank if not_nan_mask[0] == True else None
         layer_output = self.output(layer_output, hidden_states, (partitions, order))
 
         layer_outputs = (layer_output, attention_outputs[1]) if output_attentions else (layer_output,)
@@ -871,7 +872,7 @@ class SwinLayer(nn.Module):
 
 
 class SwinStage(nn.Module):
-    def __init__(self, config, dim, input_resolution, depth, num_heads, drop_path, downsample):
+    def __init__(self, config, dim, input_resolution, depth, num_heads, drop_path, downsample, rank=None):
         super().__init__()
         self.config = config
         self.dim = dim
@@ -883,6 +884,7 @@ class SwinStage(nn.Module):
                     input_resolution=input_resolution,
                     num_heads=num_heads,
                     shift_size=0 if (i % 2 == 0) else config.window_size // 2,
+                    rank=rank
                 )
                 for i in range(depth)
             ]
@@ -930,7 +932,7 @@ class SwinStage(nn.Module):
 
 
 class SwinEncoder(nn.Module):
-    def __init__(self, config, grid_size):
+    def __init__(self, config, grid_size, rank=None):
         super().__init__()
         self.num_layers = len(config.depths)
         self.config = config
@@ -945,6 +947,7 @@ class SwinEncoder(nn.Module):
                     num_heads=config.num_heads[i_layer],
                     drop_path=dpr[sum(config.depths[:i_layer]) : sum(config.depths[: i_layer + 1])],
                     downsample=SwinPatchMerging if (i_layer < self.num_layers - 1) else None,
+                    rank=rank
                 )
                 for i_layer in range(self.num_layers)
             ]
@@ -1101,17 +1104,19 @@ SWIN_INPUTS_DOCSTRING = r"""
     """,
 )
 class SwinModel(SwinPreTrainedModel):
-    def __init__(self, config, add_pooling_layer=True, use_mask_token=False):
+    def __init__(self, config, add_pooling_layer=True, use_mask_token=False, rank=None):
         super().__init__(config)
         self.config = config
         self.num_layers = len(config.depths)
         self.num_features = int(config.embed_dim * 2 ** (self.num_layers - 1))
 
         self.embeddings = SwinEmbeddings(config, use_mask_token=use_mask_token)
-        self.encoder = SwinEncoder(config, self.embeddings.patch_grid)
+        self.encoder = SwinEncoder(config, self.embeddings.patch_grid, rank=rank)
 
         self.layernorm = nn.LayerNorm(self.num_features, eps=config.layer_norm_eps)
         self.pooler = nn.AdaptiveAvgPool1d(1) if add_pooling_layer else None
+
+        self.rank = rank
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1524,12 +1529,3 @@ class SwinBackbone(SwinPreTrainedModel, BackboneMixin):
             hidden_states=outputs.hidden_states if output_hidden_states else None,
             attentions=outputs.attentions,
         )
-
-
-__all__ = [
-    "SwinForImageClassification",
-    "SwinForMaskedImageModeling",
-    "SwinModel",
-    "SwinPreTrainedModel",
-    "SwinBackbone",
-]
